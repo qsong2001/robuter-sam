@@ -105,10 +105,25 @@ def segmentation_loss(logits, mask):
     return F.binary_cross_entropy_with_logits(logits, target) + dice
 
 
+@torch.no_grad()
+def evaluate_clean(sam, transform, pairs, device):
+    """Mean per-image foreground IoU with ground-truth box prompts."""
+    total_loss = total_iou = 0.0
+    for image_path, mask_path in pairs:
+        image, mask, box = read_pair(image_path, mask_path)
+        logits = mask_logits(sam, transform, image, box, device)
+        target = torch.as_tensor(mask, dtype=torch.bool, device=device)
+        predicted = logits[0, 0] > 0
+        total_loss += segmentation_loss(logits, mask).item()
+        total_iou += ((predicted & target).sum() / (predicted | target).sum()).item()
+    return total_loss / len(pairs), total_iou / len(pairs)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--sam-checkpoint", type=Path, required=True)
     parser.add_argument("--train-manifest", type=Path, required=True)
+    parser.add_argument("--val-manifest", type=Path)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--model-type", choices=("vit_b", "vit_l", "vit_h"), default="vit_b")
     parser.add_argument("--rank", type=int, default=8)
@@ -127,6 +142,11 @@ def main():
     from segment_anything.utils.transforms import ResizeLongestSide
 
     pairs = read_manifest(args.train_manifest)
+    validation = read_manifest(args.val_manifest) if args.val_manifest else None
+    if validation:
+        train_images = {image.resolve() for image, _ in pairs}
+        if any(image.resolve() in train_images for image, _ in validation):
+            parser.error("Training and validation manifests share image paths")
     rng = random.Random(args.seed)
     torch.manual_seed(args.seed)
     device = torch.device(args.device)
@@ -150,7 +170,11 @@ def main():
             loss.backward()
             optimizer.step()
             total += loss.item()
-        print(f"Epoch {epoch + 1}/{args.epochs}: mean loss {total / len(pairs):.5f}", flush=True)
+        message = f"Epoch {epoch + 1}/{args.epochs}: train loss {total / len(pairs):.5f}"
+        if validation:
+            val_loss, val_iou = evaluate_clean(sam, transform, validation, device)
+            message += f", val loss {val_loss:.5f}, val IoU {val_iou:.2%}"
+        print(message, flush=True)
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     adapters = {name: p.detach().cpu() for name, p in sam.named_parameters() if p.requires_grad}

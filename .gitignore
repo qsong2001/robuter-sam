@@ -1,0 +1,11 @@
+__pycache__/
+.venv/
+outputs/
+checkpoints/
+datasets/*
+!datasets/README.md
+!datasets/example.jsonl
+*.pth
+*.pt
+*.ckpt
+*.safetensors
