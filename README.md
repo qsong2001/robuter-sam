@@ -5,12 +5,10 @@ Low-Rank Capacity Allocation**.
 
 This repository provides a standalone, clean-image fine-tuning baseline for
 box-prompted SAM (the original Segment Anything Model). It freezes pretrained
-SAM and trains uniform-rank LoRA adapters in the image encoder and mask
-decoder using BCE and Dice losses.
+SAM and trains LoRA adapters in the image encoder and mask
+decoder using adversarial BCE and Dice losses.
 
-This release does not implement the paper's vulnerability profiling,
-mixed-rank allocation, adversarial fine-tuning, or benchmark evaluation.
-No data or model weights are included.
+
 
 ## Repository layout
 
