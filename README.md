@@ -1,6 +1,6 @@
-# Robuster SAM — uniform LoRA fine-tuning
+# Robuster SAM
 
-Companion code for **Robustifying Segment Anything through Attack-Conditioned
+Code for **Robustifying Segment Anything through Attack-Conditioned
 Low-Rank Capacity Allocation**.
 
 This repository provides a standalone, clean-image fine-tuning baseline for
