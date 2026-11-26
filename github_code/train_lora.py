@@ -1,0 +1,165 @@
+"""Clean, uniform-rank LoRA fine-tuning for box-prompted SAM (SAM 1)."""
+
+import argparse
+import json
+import math
+import random
+from pathlib import Path
+
+import numpy as np
+from PIL import Image
+import torch
+from torch import nn
+from torch.nn import functional as F
+
+
+class LoRALinear(nn.Module):
+    """Frozen linear projection plus a trainable rank-r residual."""
+
+    def __init__(self, base: nn.Linear, rank: int, alpha: float):
+        super().__init__()
+        self.base = base.requires_grad_(False)
+        self.lora_A = nn.Parameter(base.weight.new_empty(rank, base.in_features))
+        self.lora_B = nn.Parameter(base.weight.new_zeros(base.out_features, rank))
+        nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
+        self.scale = alpha / rank
+
+    def forward(self, x):
+        return self.base(x) + self.scale * F.linear(F.linear(x, self.lora_A), self.lora_B)
+
+
+def add_uniform_lora(sam, rank, alpha):
+    if rank <= 0 or not math.isfinite(alpha) or alpha <= 0:
+        raise ValueError("Rank and alpha must be positive.")
+    sam.requires_grad_(False)
+    targets = []
+    for name, layer in list(sam.named_modules()):
+        if not isinstance(layer, nn.Linear):
+            continue
+        if not name.startswith(("image_encoder.", "mask_decoder.")):
+            continue
+        if name.startswith("mask_decoder.iou_prediction_head."):
+            continue
+        parent, _, child = name.rpartition(".")
+        setattr(sam.get_submodule(parent), child, LoRALinear(layer, rank, alpha))
+        targets.append(name)
+    if not targets:
+        raise ValueError("No SAM linear projections were matched.")
+    return targets
+
+
+def read_manifest(path):
+    rows = []
+    for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        if not line.strip():
+            continue
+        row = json.loads(line)
+        if not isinstance(row, dict) or any(
+            not isinstance(row.get(k), str) or not row[k] for k in ("image", "mask")
+        ):
+            raise ValueError(f"Invalid image/mask entry on manifest line {line_number}.")
+        rows.append(tuple(path.parent / row[k] for k in ("image", "mask")))
+    if not rows:
+        raise ValueError("Training manifest is empty.")
+    return rows
+
+
+def read_pair(image_path, mask_path):
+    with Image.open(image_path) as img:
+        image = np.array(img.convert("RGB"), copy=True)
+    with Image.open(mask_path) as img:
+        mask = np.array(img, copy=True)
+    if mask.ndim != 2 or image.shape[:2] != mask.shape:
+        raise ValueError(f"Expected a single-channel mask matching {image_path}: {mask_path}")
+    mask = mask > 0
+    yy, xx = np.nonzero(mask)
+    if xx.size == 0:
+        raise ValueError(f"Mask {mask_path} is empty; a box cannot be inferred.")
+    box = np.array([[xx.min(), yy.min(), xx.max() + 1, yy.max() + 1]], dtype=np.float32)
+    return image, mask, box
+
+
+def mask_logits(sam, transform, image, box, device):
+    """Use the component APIs so gradients reach the adapters during training."""
+    resized = transform.apply_image(image)
+    x = torch.as_tensor(np.array(resized, copy=True), device=device)
+    x = x.permute(2, 0, 1).contiguous().float()
+    features = sam.image_encoder(sam.preprocess(x).unsqueeze(0))
+    with torch.no_grad():
+        boxes = torch.as_tensor(transform.apply_boxes(box, image.shape[:2]), device=device)
+        sparse, dense = sam.prompt_encoder(points=None, boxes=boxes, masks=None)
+    logits, _ = sam.mask_decoder(
+        image_embeddings=features,
+        image_pe=sam.prompt_encoder.get_dense_pe(),
+        sparse_prompt_embeddings=sparse,
+        dense_prompt_embeddings=dense,
+        multimask_output=False,
+    )
+    return sam.postprocess_masks(logits, resized.shape[:2], image.shape[:2])
+
+
+def segmentation_loss(logits, mask):
+    target = torch.as_tensor(mask, dtype=logits.dtype, device=logits.device)[None, None]
+    probs = logits.sigmoid()
+    dice = 1 - (2 * (probs * target).sum() + 1) / (probs.sum() + target.sum() + 1)
+    return F.binary_cross_entropy_with_logits(logits, target) + dice
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--sam-checkpoint", type=Path, required=True)
+    parser.add_argument("--train-manifest", type=Path, required=True)
+    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--model-type", choices=("vit_b", "vit_l", "vit_h"), default="vit_b")
+    parser.add_argument("--rank", type=int, default=8)
+    parser.add_argument("--alpha", type=float, default=16.0)
+    parser.add_argument("--epochs", type=int, default=1)
+    parser.add_argument("--lr", type=float, default=1e-5)
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--device", default="cuda")
+    args = parser.parse_args()
+    if args.epochs <= 0 or not math.isfinite(args.lr) or args.lr <= 0:
+        parser.error("--epochs and --lr must be positive")
+    if args.output.exists():
+        parser.error(f"Output already exists: {args.output}")
+
+    from segment_anything import sam_model_registry
+    from segment_anything.utils.transforms import ResizeLongestSide
+
+    pairs = read_manifest(args.train_manifest)
+    rng = random.Random(args.seed)
+    torch.manual_seed(args.seed)
+    device = torch.device(args.device)
+    sam = sam_model_registry[args.model_type](checkpoint=str(args.sam_checkpoint))
+    targets = add_uniform_lora(sam, args.rank, args.alpha)
+    sam.to(device).eval()  # Keep the pretrained model's inference behavior; autograd remains on.
+    transform = ResizeLongestSide(sam.image_encoder.img_size)
+    trainable = [p for p in sam.parameters() if p.requires_grad]
+    optimizer = torch.optim.AdamW(trainable, lr=args.lr, weight_decay=0.01)
+    print(f"Adapting {len(targets)} projections ({sum(p.numel() for p in trainable):,} parameters).")
+
+    for epoch in range(args.epochs):
+        rng.shuffle(pairs)
+        total = 0.0
+        for image_path, mask_path in pairs:
+            image, mask, box = read_pair(image_path, mask_path)
+            optimizer.zero_grad(set_to_none=True)
+            loss = segmentation_loss(mask_logits(sam, transform, image, box, device), mask)
+            if not torch.isfinite(loss).item():
+                raise FloatingPointError(f"Nonfinite loss for {image_path}.")
+            loss.backward()
+            optimizer.step()
+            total += loss.item()
+        print(f"Epoch {epoch + 1}/{args.epochs}: mean loss {total / len(pairs):.5f}", flush=True)
+
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    adapters = {name: p.detach().cpu() for name, p in sam.named_parameters() if p.requires_grad}
+    # Exclusive creation avoids accidentally overwriting a trained adapter.
+    with args.output.open("xb") as stream:
+        torch.save({"lora": adapters, "model_type": args.model_type, "rank": args.rank,
+                    "alpha": args.alpha, "targets": targets}, stream)
+    print(f"Saved adapter weights to {args.output}")
+
+
+if __name__ == "__main__":
+    main()
