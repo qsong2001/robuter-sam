@@ -4,4 +4,4 @@
 
 Robuster SAM is a parameter-efficient approach to improving the adversarial robustness of the Segment Anything Model (SAM). It profiles how sensitive different parts of the model are to adversarial perturbations, then uses that profile to allocate different LoRA ranks while keeping the pretrained backbone frozen.
 
-**The source code will be released soon.**
+The [uniform LoRA fine-tuning code](github_code/) is available. This release contains the clean-image baseline, not the full adversarial training and evaluation pipeline.
