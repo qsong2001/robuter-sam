@@ -26,7 +26,8 @@ robuter-sam/
 │   └── example.jsonl
 ├── scripts/
 │   ├── make_manifest.py                # Build manifests from image/mask pairs
-│   └── prepare_sa1b.py                  # Decode SA-1B masks and write splits
+│   ├── prepare_sa1b.py                  # Decode SA-1B masks and write splits
+│   └── prepare_coco_eval.py            # Prepare a fixed-box COCO evaluation set
 ├── tests/
 │   └── test_smoke.py                   # Synthetic CPU tests
 └── third_party/
@@ -117,6 +118,40 @@ for split in train val; do
     --output "datasets/my_dataset/$split.jsonl"
 done
 ```
+
+### Prepare evaluation data (COCO 2017)
+
+Download **2017 Val images** and the **2017 Train/Val instance annotations**
+from the [official COCO downloads](https://cocodataset.org/#download).
+Extract `val2017/` and `annotations/instances_val2017.json` under
+`datasets/coco2017/`. Install `pycocotools` and export evaluation pairs:
+
+```bash
+python -m pip install pycocotools
+python scripts/prepare_coco_eval.py \
+  --images-dir datasets/coco2017/val2017 \
+  --instances-json datasets/coco2017/annotations/instances_val2017.json \
+  --output-dir datasets/coco_eval \
+  --max-images 128
+```
+
+The converter chooses one nonempty non-crowd instance per image, prioritizing
+the largest annotated area. It exports binary PNG masks and an `eval.jsonl`
+that points to the original images and records the selected image and
+annotation IDs. By default it visits images in sorted ID order. To use your
+own fixed list, replace `--max-images 128` with
+`--image-ids-file path/to/image_ids.txt` (one ID per line).
+
+Pass `--val-manifest datasets/coco_eval/eval.jsonl` to the training command.
+The trainer derives tight ground-truth box prompts from the masks. Clean
+validation and PGD validation start from these same inputs; adversarial
+views are generated online against the model being evaluated, so no stored
+adversarial images or separate attack cache is needed. This example is for
+the base version, not the paper's full set of benchmark splits and protocols.
+
+For another dataset, export RGB images and binary instance masks and use
+`scripts/make_manifest.py` as above. Keep evaluation images out of the
+training split.
 
 ## Train and evaluate
 
