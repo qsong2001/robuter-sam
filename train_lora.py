@@ -1,4 +1,4 @@
-"""Clean, uniform-rank LoRA fine-tuning for box-prompted SAM (SAM 1)."""
+"""Base adversarial training with uniform-rank LoRA for box-prompted SAM 1."""
 
 import argparse
 import json
@@ -79,14 +79,17 @@ def read_pair(image_path, mask_path):
     return image, mask, box
 
 
-def mask_logits(sam, transform, image, box, device):
-    """Use the component APIs so gradients reach the adapters during training."""
+def prepare_example(transform, image, box, device):
     resized = transform.apply_image(image)
     x = torch.as_tensor(np.array(resized, copy=True), device=device)
-    x = x.permute(2, 0, 1).contiguous().float()
+    boxes = torch.as_tensor(transform.apply_boxes(box, image.shape[:2]), device=device)
+    return x.permute(2, 0, 1).contiguous().float(), boxes
+
+
+def logits_from_pixels(sam, x, boxes, original_size):
+    """Use the component APIs to keep gradients through pixels and adapters."""
     features = sam.image_encoder(sam.preprocess(x).unsqueeze(0))
     with torch.no_grad():
-        boxes = torch.as_tensor(transform.apply_boxes(box, image.shape[:2]), device=device)
         sparse, dense = sam.prompt_encoder(points=None, boxes=boxes, masks=None)
     logits, _ = sam.mask_decoder(
         image_embeddings=features,
@@ -95,7 +98,12 @@ def mask_logits(sam, transform, image, box, device):
         dense_prompt_embeddings=dense,
         multimask_output=False,
     )
-    return sam.postprocess_masks(logits, resized.shape[:2], image.shape[:2])
+    return sam.postprocess_masks(logits, x.shape[-2:], original_size)
+
+
+def mask_logits(sam, transform, image, box, device):
+    x, boxes = prepare_example(transform, image, box, device)
+    return logits_from_pixels(sam, x, boxes, image.shape[:2])
 
 
 def segmentation_loss(logits, mask):
@@ -103,6 +111,23 @@ def segmentation_loss(logits, mask):
     probs = logits.sigmoid()
     dice = 1 - (2 * (probs * target).sum() + 1) / (probs.sum() + target.sum() + 1)
     return F.binary_cross_entropy_with_logits(logits, target) + dice
+
+
+def pgd_training_view(sam, pixels, boxes, mask, *, steps, epsilon):
+    """Maximize the segmentation loss in a raw-pixel L-infinity ball."""
+    base = pixels.detach()
+    low, high = (base - epsilon).clamp(0, 255), (base + epsilon).clamp(0, 255)
+    view = (base + torch.empty_like(base).uniform_(-epsilon, epsilon)).clamp(0, 255)
+    step_size = epsilon / steps
+    for _ in range(steps):
+        view = view.detach().requires_grad_(True)
+        objective = segmentation_loss(logits_from_pixels(sam, view, boxes, mask.shape), mask)
+        (gradient,) = torch.autograd.grad(objective, view)
+        if not torch.isfinite(gradient).all().item():
+            raise FloatingPointError("Nonfinite gradient in PGD.")
+        with torch.no_grad():
+            view = (view + step_size * gradient.sign()).maximum(low).minimum(high)
+    return view.detach()
 
 
 @torch.no_grad()
@@ -132,9 +157,15 @@ def main():
     parser.add_argument("--lr", type=float, default=1e-5)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", default="cuda")
+    parser.add_argument("--pgd-steps", type=int, default=3,
+                        help="PGD iterations on alternating adversarial updates (0: clean only).")
+    parser.add_argument("--epsilon", type=float, default=8.0,
+                        help="L-infinity radius in raw pixel units [0, 255].")
     args = parser.parse_args()
     if args.epochs <= 0 or not math.isfinite(args.lr) or args.lr <= 0:
         parser.error("--epochs and --lr must be positive")
+    if args.pgd_steps < 0 or not 0 < args.epsilon <= 255:
+        parser.error("--pgd-steps must be nonnegative and --epsilon must be in (0, 255]")
     if args.output.exists():
         parser.error(f"Output already exists: {args.output}")
 
@@ -158,19 +189,31 @@ def main():
     optimizer = torch.optim.AdamW(trainable, lr=args.lr, weight_decay=0.01)
     print(f"Adapting {len(targets)} projections ({sum(p.numel() for p in trainable):,} parameters).")
 
+    update = 0
     for epoch in range(args.epochs):
         rng.shuffle(pairs)
-        total = 0.0
+        sums = {"clean": 0.0, "adv": 0.0}
+        counts = {"clean": 0, "adv": 0}
         for image_path, mask_path in pairs:
             image, mask, box = read_pair(image_path, mask_path)
             optimizer.zero_grad(set_to_none=True)
-            loss = segmentation_loss(mask_logits(sam, transform, image, box, device), mask)
+            pixels, boxes = prepare_example(transform, image, box, device)
+            kind = "clean"
+            if args.pgd_steps and update % 2:
+                pixels = pgd_training_view(sam, pixels, boxes, mask,
+                                           steps=args.pgd_steps, epsilon=args.epsilon)
+                kind = "adv"
+            loss = segmentation_loss(logits_from_pixels(sam, pixels, boxes, mask.shape), mask)
             if not torch.isfinite(loss).item():
                 raise FloatingPointError(f"Nonfinite loss for {image_path}.")
             loss.backward()
             optimizer.step()
-            total += loss.item()
-        message = f"Epoch {epoch + 1}/{args.epochs}: train loss {total / len(pairs):.5f}"
+            sums[kind] += loss.item()
+            counts[kind] += 1
+            update += 1
+        losses = ", ".join(f"{k} loss {sums[k] / counts[k]:.5f} ({counts[k]} updates)"
+                           for k in ("clean", "adv") if counts[k])
+        message = f"Epoch {epoch + 1}/{args.epochs}: {losses}"
         if validation:
             val_loss, val_iou = evaluate_clean(sam, transform, validation, device)
             message += f", val loss {val_loss:.5f}, val IoU {val_iou:.2%}"
@@ -181,7 +224,8 @@ def main():
     # Exclusive creation avoids accidentally overwriting a trained adapter.
     with args.output.open("xb") as stream:
         torch.save({"lora": adapters, "model_type": args.model_type, "rank": args.rank,
-                    "alpha": args.alpha, "targets": targets}, stream)
+                    "alpha": args.alpha, "targets": targets,
+                    "pgd_steps": args.pgd_steps, "epsilon": args.epsilon}, stream)
     print(f"Saved adapter weights to {args.output}")
 
 

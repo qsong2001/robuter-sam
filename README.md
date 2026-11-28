@@ -3,16 +3,22 @@
 Code for **Robustifying Segment Anything through Attack-Conditioned
 Low-Rank Capacity Allocation**.
 
-This repository provides a standalone, clean-image fine-tuning baseline for
-box-prompted SAM (the original Segment Anything Model). It freezes pretrained
-SAM and trains LoRA adapters in the image encoder and mask
-decoder using adversarial BCE and Dice losses.
+This repository provides the **base version** of adversarial training for
+box-prompted SAM 1 with uniform-rank LoRA. It freezes pretrained SAM and
+optimizes uniform-rank adapters in the image encoder and mask decoder,
+alternating one clean update with one adversarial update. The loss is BCE
+plus Dice, and adversarial inputs are generated online with projected
+gradient descent (PGD) and fixed box prompts.
 
-
+This is a simplified training baseline, not the full paper implementation.
+It does not include vulnerability profiling, mixed-rank allocation, the
+paper's full attack suite, or benchmark evaluation. No data or model weights
+are included.
 
 ## Repository layout
 
-- **train_lora.py** — clean-image training, optional validation, and adapter export.
+- **train_lora.py** — uniform LoRA adversarial training, optional clean validation,
+  and adapter export.
 - **scripts/make_manifest.py** — build JSONL splits from image and mask folders.
 - **datasets/** — dataset layout and example manifest; place your own data here.
 - **tests/** — synthetic CPU smoke test (no data or checkpoints required).
@@ -61,13 +67,20 @@ python train_lora.py \
   --train-manifest datasets/my_dataset/train.jsonl \
   --val-manifest datasets/my_dataset/val.jsonl \
   --output outputs/uniform-r8.pth \
-  --model-type vit_b --rank 8 --alpha 16 --epochs 1 --device cuda
+  --model-type vit_b --rank 8 --alpha 16 --epochs 1 --device cuda \
+  --pgd-steps 3 --epsilon 8
 ```
 
 The script trains on one image per optimizer update and saves only the adapter
-tensors and their configuration. If a validation manifest is supplied, it
-logs clean mask loss and mean per-image foreground IoU after each epoch.
-It does not overwrite an existing output.
+tensors and their configuration. PGD starts at a random perturbation and uses
+step size epsilon divided by the number of steps. The default radius is 8
+in the raw [0, 255] pixel scale (8/255 on [0, 1]); the perturbation is applied
+after resizing and before SAM normalization and padding. Set
+`--pgd-steps 0` to train on clean inputs only.
+
+Training logs clean and adversarial loss separately. If a validation manifest
+is supplied, it also logs clean validation loss and mean per-image foreground
+IoU after each epoch. The script does not overwrite an existing output.
 Run `python train_lora.py --help` for more options.
 
 Run the synthetic CPU test with `OMP_NUM_THREADS=1 python -m unittest discover -s tests`.

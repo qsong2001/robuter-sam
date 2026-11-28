@@ -13,7 +13,7 @@ from segment_anything import sam_model_registry
 from segment_anything.modeling import (
     ImageEncoderViT, MaskDecoder, PromptEncoder, Sam, TwoWayTransformer,
 )
-from train_lora import main
+from train_lora import main, pgd_training_view
 
 
 def tiny_sam(checkpoint=None):
@@ -30,6 +30,21 @@ def tiny_sam(checkpoint=None):
 
 
 class TestRelease(unittest.TestCase):
+    def test_pgd_budget_and_input_only_gradient(self):
+        model = tiny_sam().eval()
+        from train_lora import add_uniform_lora
+        add_uniform_lora(model, 2, 4)
+        pixels = torch.full((3, 32, 64), 128.0)
+        boxes = torch.tensor([[8.0, 4.0, 48.0, 24.0]])
+        mask = np.zeros((32, 64), dtype=bool)
+        mask[4:24, 8:48] = True
+        view = pgd_training_view(model, pixels, boxes, mask, steps=2, epsilon=8.0)
+        self.assertFalse(view.requires_grad)
+        self.assertLessEqual((pixels - view).abs().max().item(), 8.0)
+        self.assertTrue(torch.all((view >= 0) & (view <= 255)).item())
+        self.assertFalse(torch.equal(view, pixels))
+        self.assertTrue(all(p.grad is None for p in model.parameters()))
+
     def test_train_validate_and_save_on_synthetic_data(self):
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)
@@ -47,10 +62,14 @@ class TestRelease(unittest.TestCase):
                 "--train-manifest", str(root / "train.jsonl"),
                 "--val-manifest", str(root / "val.jsonl"),
                 "--output", str(root / "adapter.pth"),
+                "--epochs", "2", "--pgd-steps", "2",
             ]
-            with patch.dict(sam_model_registry, {"vit_b": tiny_sam}), patch("sys.argv", args):
+            with patch.dict(sam_model_registry, {"vit_b": tiny_sam}), patch("sys.argv", args), \
+                    patch("train_lora.pgd_training_view", wraps=pgd_training_view) as attack:
                 main()
+                self.assertEqual(attack.call_count, 1)
             saved = torch.load(root / "adapter.pth", weights_only=True)
+            self.assertEqual(saved["pgd_steps"], 2)
             self.assertEqual(len(saved["lora"]), 2 * len(saved["targets"]))
             self.assertTrue(all(n.endswith((".lora_A", ".lora_B")) for n in saved["lora"]))
             self.assertTrue(any(t.abs().max().item() > 0 for n, t in saved["lora"].items()
