@@ -25,7 +25,8 @@ robuter-sam/
 │   ├── README.md                       # Image/mask and train/val layout
 │   └── example.jsonl
 ├── scripts/
-│   └── make_manifest.py                # Build manifests from image/mask pairs
+│   ├── make_manifest.py                # Build manifests from image/mask pairs
+│   └── prepare_sa1b.py                  # Decode SA-1B masks and write splits
 ├── tests/
 │   └── test_smoke.py                   # Synthetic CPU tests
 └── third_party/
@@ -50,6 +51,32 @@ Download the matching SAM 1 checkpoint from the
 and save it under **checkpoints/**.
 
 ## Prepare your dataset
+
+### Option A: Use SA-1B
+
+1. Download a shard such as `sa000000` from the [official SA-1B dataset page](https://ai.meta.com/datasets/segment-anything/)
+   under its dataset terms. Extract it locally; the shard should contain
+   the images (e.g., `sa_1.jpg`) and their per-image COCO RLE annotations
+   (e.g., `sa_1.json`) side by side. You do not need the entire dataset.
+2. Install `pycocotools` and convert a subset:
+
+```bash
+python -m pip install pycocotools
+python scripts/prepare_sa1b.py \
+  --shard-dir datasets/sa1b_raw/sa000000 \
+  --output-dir datasets/sa1b_demo \
+  --max-images 2000 --val-fraction 0.1 --seed 0
+```
+
+The converter selects the largest nonempty annotated mask per image, saves it
+as a binary PNG, and writes `train.jsonl` and `val.jsonl` with a
+deterministic image-level split. Keep the extracted shard in place; the
+manifests reference its images without copying them. Pass
+`datasets/sa1b_demo/train.jsonl` and `datasets/sa1b_demo/val.jsonl`
+to the training command below. This is an example base-version split,
+not the paper's exact training and evaluation split.
+
+### Option B: Use your own image/mask pairs
 
 Put your dataset under `datasets/my_dataset/` like this:
 
