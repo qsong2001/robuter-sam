@@ -1,5 +1,8 @@
 """Run with: python -m unittest discover -s tests."""
 import json
+import contextlib
+import io
+import re
 from pathlib import Path
 import tempfile
 import unittest
@@ -63,11 +66,16 @@ class TestRelease(unittest.TestCase):
                 "--val-manifest", str(root / "val.jsonl"),
                 "--output", str(root / "adapter.pth"),
                 "--epochs", "2", "--pgd-steps", "2",
+                "--eval-pgd-steps", "2",
             ]
             with patch.dict(sam_model_registry, {"vit_b": tiny_sam}), patch("sys.argv", args), \
-                    patch("train_lora.pgd_training_view", wraps=pgd_training_view) as attack:
+                    patch("train_lora.pgd_training_view", wraps=pgd_training_view) as attack, \
+                    contextlib.redirect_stdout(io.StringIO()) as output:
                 main()
                 self.assertEqual(attack.call_count, 1)
+            scores = re.findall(r"val IoU ([0-9.]+)%, val PGD-2 IoU ([0-9.]+)%", output.getvalue())
+            self.assertEqual(len(scores), 2)
+            self.assertTrue(all(float(robust) <= float(clean) for clean, robust in scores))
             saved = torch.load(root / "adapter.pth", weights_only=True)
             self.assertEqual(saved["pgd_steps"], 2)
             self.assertEqual(len(saved["lora"]), 2 * len(saved["targets"]))

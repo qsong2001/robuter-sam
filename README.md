@@ -17,13 +17,23 @@ are included.
 
 ## Repository layout
 
-- **train_lora.py** — uniform LoRA adversarial training, optional clean validation,
-  and adapter export.
-- **scripts/make_manifest.py** — build JSONL splits from image and mask folders.
-- **datasets/** — dataset layout and example manifest; place your own data here.
-- **tests/** — synthetic CPU smoke test (no data or checkpoints required).
-- **third_party/segment-anything/** — original SAM 1 Python source, pinned to
-  an upstream revision, with the original license and attribution.
+```text
+robuter-sam/
+├── train_lora.py                       # Training, validation, adapter export
+├── requirements.txt
+├── datasets/
+│   ├── README.md                       # Image/mask and train/val layout
+│   └── example.jsonl
+├── scripts/
+│   └── make_manifest.py                # Build manifests from image/mask pairs
+├── tests/
+│   └── test_smoke.py                   # Synthetic CPU tests
+└── third_party/
+    └── segment-anything/               # Original SAM 1 source and license
+```
+
+Place local model weights in **checkpoints/** and save trained adapters
+under **outputs/**. Neither directory is shipped.
 
 ## Setup
 
@@ -39,15 +49,35 @@ Download the matching SAM 1 checkpoint from the
 [official SAM repository](https://github.com/facebookresearch/segment-anything#model-checkpoints)
 and save it under **checkpoints/**.
 
-## Train
+## Prepare your dataset
 
-Create a JSON Lines manifest with one RGB image and one single-channel binary
-foreground mask per example. Relative paths are resolved against the manifest
-directory. See the [dataset layout](datasets/README.md) for the expected
-train and validation folders. A tight box is derived from each mask.
+Put your dataset under `datasets/my_dataset/` like this:
+
+```text
+datasets/my_dataset/
+├── train/
+│   ├── images/scene001.jpg
+│   └── masks/scene001.png
+└── val/
+    ├── images/scene101.jpg
+    └── masks/scene101.png
+```
+
+Each RGB image needs one single-channel binary mask for the target object
+(`0` is background; nonzero is foreground). Image and mask dimensions
+must match. Use the same filename stem and relative subdirectory for each
+pair. For example, `images/city/001.jpg` pairs with
+`masks/city/001.png`. Split by image before exporting train/val masks:
+the same image must not appear in both splits. For multi-object annotations,
+export instance masks first; the trainer derives a tight box from each
+nonempty mask.
+
+The manifest is JSON Lines, one image/mask pair per line. All relative paths
+are resolved from the manifest's directory. For example,
+`datasets/my_dataset/train.jsonl` contains:
 
 ```jsonl
-{"image":"images/example.jpg","mask":"masks/example.png"}
+{"image":"train/images/scene001.jpg","mask":"train/masks/scene001.png"}
 ```
 
 To build manifests from the example directory structure:
@@ -61,6 +91,8 @@ for split in train val; do
 done
 ```
 
+## Train and evaluate
+
 ```bash
 python train_lora.py \
   --sam-checkpoint checkpoints/sam_vit_b_01ec64.pth \
@@ -68,7 +100,7 @@ python train_lora.py \
   --val-manifest datasets/my_dataset/val.jsonl \
   --output outputs/uniform-r8.pth \
   --model-type vit_b --rank 8 --alpha 16 --epochs 1 --device cuda \
-  --pgd-steps 3 --epsilon 8
+  --pgd-steps 3 --eval-pgd-steps 5 --epsilon 8
 ```
 
 The script trains on one image per optimizer update and saves only the adapter
@@ -79,8 +111,12 @@ after resizing and before SAM normalization and padding. Set
 `--pgd-steps 0` to train on clean inputs only.
 
 Training logs clean and adversarial loss separately. If a validation manifest
-is supplied, it also logs clean validation loss and mean per-image foreground
-IoU after each epoch. The script does not overwrite an existing output.
+is supplied, it reports clean validation loss and IoU, plus PGD-5 IoU after
+each epoch. The robust metric averages the worst IoU per image over the clean
+view, one seeded random start, and all PGD iterates. Evaluation uses the same
+perturbation budget and fixed ground-truth box prompts; it does not update
+the model. Use `--eval-pgd-steps 0` to disable PGD validation without changing
+the training attack. The script does not overwrite an existing output.
 Run `python train_lora.py --help` for more options.
 
 Run the synthetic CPU test with `OMP_NUM_THREADS=1 python -m unittest discover -s tests`.

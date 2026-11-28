@@ -113,35 +113,59 @@ def segmentation_loss(logits, mask):
     return F.binary_cross_entropy_with_logits(logits, target) + dice
 
 
-def pgd_training_view(sam, pixels, boxes, mask, *, steps, epsilon):
-    """Maximize the segmentation loss in a raw-pixel L-infinity ball."""
+def pgd_views(sam, pixels, boxes, mask, *, steps, epsilon, generator=None):
+    """Yield a random start and each projected PGD iterate as detached pixels."""
     base = pixels.detach()
     low, high = (base - epsilon).clamp(0, 255), (base + epsilon).clamp(0, 255)
-    view = (base + torch.empty_like(base).uniform_(-epsilon, epsilon)).clamp(0, 255)
+    noise = torch.empty_like(base).uniform_(-epsilon, epsilon, generator=generator)
+    view = (base + noise).clamp(0, 255)
     step_size = epsilon / steps
+    yield view
     for _ in range(steps):
-        view = view.detach().requires_grad_(True)
-        objective = segmentation_loss(logits_from_pixels(sam, view, boxes, mask.shape), mask)
-        (gradient,) = torch.autograd.grad(objective, view)
+        with torch.enable_grad():
+            view = view.detach().requires_grad_(True)
+            objective = segmentation_loss(logits_from_pixels(sam, view, boxes, mask.shape), mask)
+            (gradient,) = torch.autograd.grad(objective, view)
         if not torch.isfinite(gradient).all().item():
             raise FloatingPointError("Nonfinite gradient in PGD.")
         with torch.no_grad():
             view = (view + step_size * gradient.sign()).maximum(low).minimum(high)
-    return view.detach()
+        yield view
+
+
+def pgd_training_view(sam, pixels, boxes, mask, *, steps, epsilon):
+    for view in pgd_views(sam, pixels, boxes, mask, steps=steps, epsilon=epsilon):
+        pass
+    return view
+
+
+def foreground_iou(logits, target):
+    predicted = logits[0, 0] > 0
+    return ((predicted & target).sum() / (predicted | target).sum()).item()
 
 
 @torch.no_grad()
-def evaluate_clean(sam, transform, pairs, device):
-    """Mean per-image foreground IoU with ground-truth box prompts."""
-    total_loss = total_iou = 0.0
+def evaluate_validation(sam, transform, pairs, device, *, pgd_steps=0, epsilon=8.0, seed=0):
+    """Clean metrics and worst-visited PGD IoU, with fixed ground-truth boxes."""
+    total_loss = total_iou = total_robust_iou = 0.0
+    generator = torch.Generator(device=device).manual_seed(seed) if pgd_steps else None
     for image_path, mask_path in pairs:
         image, mask, box = read_pair(image_path, mask_path)
-        logits = mask_logits(sam, transform, image, box, device)
+        pixels, boxes = prepare_example(transform, image, box, device)
+        logits = logits_from_pixels(sam, pixels, boxes, mask.shape)
         target = torch.as_tensor(mask, dtype=torch.bool, device=device)
-        predicted = logits[0, 0] > 0
         total_loss += segmentation_loss(logits, mask).item()
-        total_iou += ((predicted & target).sum() / (predicted | target).sum()).item()
-    return total_loss / len(pairs), total_iou / len(pairs)
+        clean_iou = foreground_iou(logits, target)
+        total_iou += clean_iou
+        if pgd_steps:
+            robust_iou = clean_iou
+            for view in pgd_views(sam, pixels, boxes, mask, steps=pgd_steps,
+                                  epsilon=epsilon, generator=generator):
+                robust_iou = min(robust_iou,
+                                 foreground_iou(logits_from_pixels(sam, view, boxes, mask.shape), target))
+            total_robust_iou += robust_iou
+    return (total_loss / len(pairs), total_iou / len(pairs),
+            total_robust_iou / len(pairs) if pgd_steps else None)
 
 
 def main():
@@ -159,13 +183,15 @@ def main():
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--pgd-steps", type=int, default=3,
                         help="PGD iterations on alternating adversarial updates (0: clean only).")
+    parser.add_argument("--eval-pgd-steps", type=int, default=5,
+                        help="PGD iterations for validation when --val-manifest is set (0: skip PGD).")
     parser.add_argument("--epsilon", type=float, default=8.0,
                         help="L-infinity radius in raw pixel units [0, 255].")
     args = parser.parse_args()
     if args.epochs <= 0 or not math.isfinite(args.lr) or args.lr <= 0:
         parser.error("--epochs and --lr must be positive")
-    if args.pgd_steps < 0 or not 0 < args.epsilon <= 255:
-        parser.error("--pgd-steps must be nonnegative and --epsilon must be in (0, 255]")
+    if min(args.pgd_steps, args.eval_pgd_steps) < 0 or not 0 < args.epsilon <= 255:
+        parser.error("PGD step counts must be nonnegative and --epsilon must be in (0, 255]")
     if args.output.exists():
         parser.error(f"Output already exists: {args.output}")
 
@@ -215,8 +241,13 @@ def main():
                            for k in ("clean", "adv") if counts[k])
         message = f"Epoch {epoch + 1}/{args.epochs}: {losses}"
         if validation:
-            val_loss, val_iou = evaluate_clean(sam, transform, validation, device)
+            val_loss, val_iou, robust_iou = evaluate_validation(
+                sam, transform, validation, device, pgd_steps=args.eval_pgd_steps,
+                epsilon=args.epsilon, seed=args.seed,
+            )
             message += f", val loss {val_loss:.5f}, val IoU {val_iou:.2%}"
+            if robust_iou is not None:
+                message += f", val PGD-{args.eval_pgd_steps} IoU {robust_iou:.2%} (worst visited)"
         print(message, flush=True)
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
